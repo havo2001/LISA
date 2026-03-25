@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 from functools import partial
-
+os.environ["MPLBACKEND"] = "Agg"
 import numpy as np
 import torch
 import tqdm
@@ -96,10 +96,10 @@ def validate(val_loader, model, writer, args):
 
         input_dict = dict_to_cuda(input_dict)
         if args.precision == "fp16":
-            input_dict["images"] = input_dict["images"].half()
-            input_dict["images_clip"] = input_dict["images_clip"].half()
+            input_dict["images"] = input_dict["images"].float()          # SAM stays fp32
+            input_dict["images_clip"] = input_dict["images_clip"].half() # CLIP can stay fp16
         elif args.precision == "bf16":
-            input_dict["images"] = input_dict["images"].bfloat16()
+            input_dict["images"] = input_dict["images"].float()               # SAM stays fp32
             input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
         else:
             input_dict["images"] = input_dict["images"].float()
