@@ -1,4 +1,6 @@
 **/__pycache__
 runs/
 .vscode/
+/venv
 
+.DS_Store

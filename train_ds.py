@@ -16,9 +16,20 @@ from torch.utils.tensorboard import SummaryWriter
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn
+from utils.busi import BUSIValDataset
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
+
+def dice_score(pred, gt, eps=1e-6):
+    pred = pred.float()
+    gt = gt.float()
+
+    intersection = (pred * gt).sum()
+    union = pred.sum() + gt.sum()
+
+    dice = (2 * intersection + eps) / (union + eps)
+    return dice
 
 
 def parse_args(args):
@@ -251,13 +262,23 @@ def main(args):
     )
 
     if args.no_eval == False:
-        val_dataset = ValDataset(
-            args.dataset_dir,
-            tokenizer,
-            args.vision_tower,
-            args.val_dataset,
-            args.image_size,
-        )
+        if args.val_dataset.startswith("BUSI|"):
+            _, split = args.val_dataset.split("|")
+            json_path = "utils/busi.json"
+            val_dataset = BUSIValDataset(
+                json_path=json_path,
+                tokenizer=tokenizer,
+                vision_tower=args.vision_tower,
+                image_size=args.image_size,
+            )
+        else:
+            val_dataset = ValDataset(
+                args.dataset_dir,
+                tokenizer,
+                args.vision_tower,
+                args.val_dataset,
+                args.image_size,
+            )
         print(
             f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
         )
@@ -520,10 +541,12 @@ def train(
     return train_iter
 
 
+
 def validate(val_loader, model_engine, epoch, writer, args):
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
+    acc_dice_meter = AverageMeter("gDice", ":6.3f", Summary.SUM)
 
     model_engine.eval()
 
@@ -550,6 +573,7 @@ def validate(val_loader, model_engine, epoch, writer, args):
         assert len(pred_masks) == 1
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
+        acc_dice = 0.0
         for mask_i, output_i in zip(masks_list, output_list):
             intersection_i, union_i, _ = intersectionAndUnionGPU(
                 output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
@@ -558,6 +582,15 @@ def validate(val_loader, model_engine, epoch, writer, args):
             union += union_i
             acc_iou += intersection_i / (union_i + 1e-5)
             acc_iou[union_i == 0] += 1.0  # no-object target
+
+            # Dice per sample: 2*intersection / (union + intersection)
+            dice_i = 2 * intersection_i / (union_i + intersection_i + 1e-5)
+            dice_i[union_i == 0] = 1.0   # no-object target
+            acc_dice += dice_i 
+
+        acc_dice = acc_dice.cpu().numpy() / masks_list.shape[0]   # <-- add this
+        acc_dice_meter.update(acc_dice, n=masks_list.shape[0])  
+
         intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
         acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
         intersection_meter.update(intersection), union_meter.update(
@@ -567,15 +600,23 @@ def validate(val_loader, model_engine, epoch, writer, args):
     intersection_meter.all_reduce()
     union_meter.all_reduce()
     acc_iou_meter.all_reduce()
+    acc_dice_meter.all_reduce() 
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     ciou = iou_class[1]
     giou = acc_iou_meter.avg[1]
+    # class-wise Dice from accumulated sums
+    dice_class = 2 * intersection_meter.sum / (union_meter.sum + intersection_meter.sum + 1e-10)
+    cdice = dice_class[1]          # <-- add this
+    gdice = acc_dice_meter.avg[1]  # <-- add this
+
 
     if args.local_rank == 0:
         writer.add_scalar("val/giou", giou, epoch)
         writer.add_scalar("val/ciou", ciou, epoch)
-        print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
+        writer.add_scalar("val/gdice", gdice, epoch)   # <-- add this
+        writer.add_scalar("val/cdice", cdice, epoch)   # <-- add this
+        print("giou: {:.4f}, ciou: {:.4f}, gdice: {:.4f}, cdice: {:.4f}".format(giou, ciou, gdice, cdice))
 
     return giou, ciou
 
