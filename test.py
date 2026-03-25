@@ -3,6 +3,7 @@ import os
 import sys
 from functools import partial
 os.environ["MPLBACKEND"] = "Agg"
+import cv2
 import numpy as np
 import torch
 import tqdm
@@ -64,6 +65,8 @@ def parse_args(args):
                         help="Path to merged model checkpoint (.pth)")
     # TensorBoard
     parser.add_argument("--log_dir", default="./runs/busi_test", type=str)
+    parser.add_argument("--vis_save_path", default="./vis_output/busi", type=str,
+                        help="Directory to save predicted mask images")
     return parser.parse_args(args)
 
 
@@ -112,6 +115,29 @@ def validate(val_loader, model, writer, args):
         masks_list = output_dict["gt_masks"][0].int()
         output_list = (pred_masks[0] > 0).int()
         assert len(pred_masks) == 1
+
+        # Save predicted mask images
+        image_path = input_dict["image_paths"][0]
+        image_name = os.path.splitext(os.path.basename(image_path))[0]
+        image_np = cv2.imread(image_path)
+        image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+        for i, output_i in enumerate(output_list):
+            pred_mask = output_i.cpu().numpy().astype(bool)
+
+            # Binary mask (mask * 100 for visibility)
+            mask_save_path = os.path.join(args.vis_save_path, f"{image_name}_mask_{i}.jpg")
+            cv2.imwrite(mask_save_path, pred_mask.astype(np.uint8) * 100)
+
+            # Red overlay on original image
+            overlay_save_path = os.path.join(args.vis_save_path, f"{image_name}_masked_img_{i}.jpg")
+            save_img = image_np.copy()
+            save_img[pred_mask] = (
+                image_np * 0.5
+                + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
+            )[pred_mask]
+            save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(overlay_save_path, save_img)
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         acc_dice = 0.0
@@ -167,6 +193,7 @@ def main(args):
     args = parse_args(args)
 
     os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.vis_save_path, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
 
     # Tokenizer
