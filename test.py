@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 from functools import partial
+from typing import Any
 os.environ["MPLBACKEND"] = "Agg"
 import cv2
 import numpy as np
@@ -83,14 +84,16 @@ def find_linear_layers(model, lora_target_modules):
             and any(x in name for x in lora_target_modules)
         ):
             lora_module_names.add(name)
-    return sorted(list(lora_module_names))
+    return sorted(list[Any](lora_module_names))
 
 
 def validate(val_loader, model, writer, args):
-    intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
-    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
-    acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
-    acc_dice_meter = AverageMeter("gDice", ":6.3f", Summary.SUM)
+    iou_list = []
+    dice_list = []
+    total_intersection = 0.0
+    total_union = 0.0
+    total_pred = 0.0
+    total_gt = 0.0
 
     model.eval()
 
@@ -99,10 +102,10 @@ def validate(val_loader, model, writer, args):
 
         input_dict = dict_to_cuda(input_dict)
         if args.precision == "fp16":
-            input_dict["images"] = input_dict["images"].float()          # SAM stays fp32
-            input_dict["images_clip"] = input_dict["images_clip"].half() # CLIP can stay fp16
+            input_dict["images"] = input_dict["images"].float()
+            input_dict["images_clip"] = input_dict["images_clip"].half()
         elif args.precision == "bf16":
-            input_dict["images"] = input_dict["images"].float()               # SAM stays fp32
+            input_dict["images"] = input_dict["images"].float()
             input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
         else:
             input_dict["images"] = input_dict["images"].float()
@@ -111,66 +114,93 @@ def validate(val_loader, model, writer, args):
         with torch.no_grad():
             output_dict = model(**input_dict)
 
-        pred_masks = output_dict["pred_masks"]
-        masks_list = output_dict["gt_masks"][0].int()
-        output_list = (pred_masks[0] > 0).int()
+        pred_masks = output_dict["pred_masks"]      # list
+        gt_masks = output_dict["gt_masks"][0]       # [num_masks, H, W]
         assert len(pred_masks) == 1
 
-        # Save predicted mask images
+        # original image for visualization
         image_path = input_dict["image_paths"][0]
         image_name = os.path.splitext(os.path.basename(image_path))[0]
         image_np = cv2.imread(image_path)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
 
-        for i, output_i in enumerate(output_list):
-            pred_mask = output_i.cpu().numpy().astype(bool)
+        for i, (pred_i, gt_i) in enumerate(zip(pred_masks[0], gt_masks)):
+            # pred_i: logits -> binary
+            pred_i = pred_i.detach().float()
+            gt_i = gt_i.detach().float()
 
-            # Binary mask (mask * 100 for visibility)
-            mask_save_path = os.path.join(args.vis_save_path, f"{image_name}_mask_{i}.jpg")
-            cv2.imwrite(mask_save_path, pred_mask.astype(np.uint8) * 100)
+            # Make prediction same size as GT for metrics
+            if pred_i.shape != gt_i.shape:
+                pred_i = torch.nn.functional.interpolate(
+                    pred_i[None, None],
+                    size=gt_i.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0]
 
-            # Red overlay on original image
-            overlay_save_path = os.path.join(args.vis_save_path, f"{image_name}_masked_img_{i}.jpg")
+            pred_bin = (pred_i > 0).to(torch.uint8)
+            gt_bin = (gt_i > 0).to(torch.uint8)
+
+            pred_np = pred_bin.cpu().numpy()
+            gt_np = gt_bin.cpu().numpy()
+
+            # ----- metrics -----
+            intersection = np.logical_and(pred_np == 1, gt_np == 1).sum()
+            pred_area = (pred_np == 1).sum()
+            gt_area = (gt_np == 1).sum()
+            union = pred_area + gt_area - intersection
+
+            if union == 0:
+                iou = 1.0
+            else:
+                iou = intersection / (union + 1e-8)
+
+            if pred_area + gt_area == 0:
+                dice = 1.0
+            else:
+                dice = 2.0 * intersection / (pred_area + gt_area + 1e-8)
+
+            iou_list.append(iou)
+            dice_list.append(dice)
+
+            total_intersection += intersection
+            total_union += union
+            total_pred += pred_area
+            total_gt += gt_area
+
+            # ----- save binary prediction mask -----
+            mask_save_path = os.path.join(args.vis_save_path, f"{image_name}_mask_{i}.png")
+            cv2.imwrite(mask_save_path, pred_np.astype(np.uint8) * 255)
+
+            # ----- overlay on original image -----
+            pred_vis = pred_np
+            if pred_vis.shape != image_np.shape[:2]:
+                pred_vis = cv2.resize(
+                    pred_vis.astype(np.uint8),
+                    (image_np.shape[1], image_np.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            else:
+                pred_vis = pred_vis.astype(bool)
+
             save_img = image_np.copy()
-            save_img[pred_mask] = (
-                image_np * 0.5
-                + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
-            )[pred_mask]
-            save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(overlay_save_path, save_img)
+            save_img[pred_vis] = (
+                0.5 * save_img[pred_vis] + 0.5 * np.array([255, 0, 0])
+            ).astype(np.uint8)
 
-        intersection, union, acc_iou = 0.0, 0.0, 0.0
-        acc_dice = 0.0
-        for mask_i, output_i in zip(masks_list, output_list):
-            intersection_i, union_i, _ = intersectionAndUnionGPU(
-                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
-            )
-            intersection += intersection_i
-            union += union_i
-            acc_iou += intersection_i / (union_i + 1e-5)
-            acc_iou[union_i == 0] += 1.0  # no-object target
+            overlay_save_path = os.path.join(args.vis_save_path, f"{image_name}_masked_img_{i}.png")
+            save_img_bgr = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(overlay_save_path, save_img_bgr)
 
-            dice_i = 2 * intersection_i / (union_i + intersection_i + 1e-5)
-            dice_i[union_i == 0] = 1.0    # no-object target
-            acc_dice += dice_i
+        # optional: also save GT mask for debugging
+        # gt_save_path = os.path.join(args.vis_save_path, f"{image_name}_gt_{i}.png")
+        # cv2.imwrite(gt_save_path, gt_np.astype(np.uint8) * 255)
 
-        acc_dice = acc_dice.cpu().numpy() / masks_list.shape[0]
-        acc_dice_meter.update(acc_dice, n=masks_list.shape[0])
+    giou = float(np.mean(iou_list)) if len(iou_list) > 0 else 0.0
+    gdice = float(np.mean(dice_list)) if len(dice_list) > 0 else 0.0
 
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
-        intersection_meter.update(intersection)
-        union_meter.update(union)
-        acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
-
-    # No all_reduce — single GPU, no distributed
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    ciou = iou_class[1]
-    giou = acc_iou_meter.avg[1]
-
-    dice_class = 2 * intersection_meter.sum / (union_meter.sum + intersection_meter.sum + 1e-10)
-    cdice = dice_class[1]
-    gdice = acc_dice_meter.avg[1]
+    ciou = float(total_intersection / (total_union + 1e-8)) if total_union > 0 else 1.0
+    cdice = float(2.0 * total_intersection / (total_pred + total_gt + 1e-8)) if (total_pred + total_gt) > 0 else 1.0
 
     if writer is not None:
         writer.add_scalar("val/giou", giou, 0)
@@ -181,9 +211,9 @@ def validate(val_loader, model, writer, args):
     print("=" * 50)
     print("BUSI Evaluation Results")
     print(f"  gIoU  (mean per-sample IoU):  {giou:.4f}")
-    print(f"  cIoU  (cumulative IoU):        {ciou:.4f}")
-    print(f"  gDice (mean per-sample Dice):  {gdice:.4f}")
-    print(f"  cDice (cumulative Dice):       {cdice:.4f}")
+    print(f"  cIoU  (cumulative IoU):       {ciou:.4f}")
+    print(f"  gDice (mean per-sample Dice): {gdice:.4f}")
+    print(f"  cDice (cumulative Dice):      {cdice:.4f}")
     print("=" * 50)
 
     return giou, ciou, gdice, cdice
