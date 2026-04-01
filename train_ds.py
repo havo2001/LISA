@@ -4,7 +4,11 @@ import shutil
 import sys
 import time
 from functools import partial
+import os
+os.environ["MPLBACKEND"] = "agg"
 
+import matplotlib
+matplotlib.use("agg")
 import deepspeed
 import numpy as np
 import torch
@@ -21,7 +25,6 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
 
-os.environ["MPLBACKEND"] = "Agg"
 
 def dice_score(pred, gt, eps=1e-6):
     pred = pred.float()
@@ -103,6 +106,8 @@ def parse_args(args):
     parser.add_argument("--eval_only", action="store_true", default=False)
     parser.add_argument("--busi_json", default="utils/busi.json", type=str,
                         help="Path to busi.json; used when --val_dataset=BUSI|test")
+    parser.add_argument("--busi_train_json", default="", type=str,
+                        help="Path to train_busi.json; if set, BUSI samples are mixed into training")
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--resume", default="", type=str)
@@ -244,26 +249,51 @@ def main(args):
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
-    train_dataset = HybridDataset(
-        args.dataset_dir,
-        tokenizer,
-        args.vision_tower,
-        samples_per_epoch=args.batch_size
-        * args.grad_accumulation_steps
-        * args.steps_per_epoch
-        * world_size,
-        precision=args.precision,
-        image_size=args.image_size,
-        num_classes_per_sample=args.num_classes_per_sample,
-        exclude_val=args.exclude_val,
-        dataset=args.dataset,
-        sample_rate=[float(x) for x in args.sample_rates.split(",")],
-        sem_seg_data=args.sem_seg_data,
-        refer_seg_data=args.refer_seg_data,
-        vqa_data=args.vqa_data,
-        reason_seg_data=args.reason_seg_data,
-        explanatory=args.explanatory,
-    )
+
+    if not args.eval_only:
+        train_dataset = HybridDataset(
+            args.dataset_dir,
+            tokenizer,
+            args.vision_tower,
+            samples_per_epoch=args.batch_size
+            * args.grad_accumulation_steps
+            * args.steps_per_epoch
+            * world_size,
+            precision=args.precision,
+            image_size=args.image_size,
+            num_classes_per_sample=args.num_classes_per_sample,
+            exclude_val=args.exclude_val,
+            dataset=args.dataset,
+            sample_rate=[float(x) for x in args.sample_rates.split(",")],
+            sem_seg_data=args.sem_seg_data,
+            refer_seg_data=args.refer_seg_data,
+            vqa_data=args.vqa_data,
+            reason_seg_data=args.reason_seg_data,
+            explanatory=args.explanatory,
+        )
+        if args.busi_train_json:
+            busi_train_dataset = BUSIValDataset(
+                json_path=args.busi_train_json,
+                tokenizer=tokenizer,
+                vision_tower=args.vision_tower,
+                image_size=args.image_size,
+            )
+            # Mirror HybridDataset's pattern: strip the val-time inference=True
+            # that BUSIValDataset returns, and replace with inference=False for training.
+            class _BUSITrainWrapper(torch.utils.data.Dataset):
+                def __init__(self, ds):
+                    self.ds = ds
+                def __len__(self):
+                    return len(self.ds)
+                def __getitem__(self, idx):
+                    *sample, _ = self.ds[idx]   # drop inference=True
+                    return (*sample, False)      # append inference=False
+            train_dataset = torch.utils.data.ConcatDataset(
+                [train_dataset, _BUSITrainWrapper(busi_train_dataset)]
+            )
+            print(f"Mixed in {len(busi_train_dataset)} BUSI training samples.")
+    else:
+        train_dataset = None
 
     if args.no_eval == False:
         if args.val_dataset.startswith("BUSI|"):
@@ -281,12 +311,16 @@ def main(args):
                 args.val_dataset,
                 args.image_size,
             )
-        print(
-            f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
-        )
+        if not args.eval_only:
+            print(
+                f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
+            )
+        else:
+            print(f"Evaluating on {len(val_dataset)} examples.")
     else:
         val_dataset = None
-        print(f"Training with {len(train_dataset)} examples.")
+        if not args.eval_only:
+            print(f"Training with {len(train_dataset)} examples.")
 
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
@@ -325,18 +359,22 @@ def main(args):
             "allgather_bucket_size": 5e8,
         },
     }
-    model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
+    ds_init_kwargs = dict(
         model=model,
         model_parameters=model.parameters(),
-        training_data=train_dataset,
-        collate_fn=partial(
+        config=ds_config,
+    )
+    if not args.eval_only:
+        ds_init_kwargs["training_data"] = train_dataset
+        ds_init_kwargs["collate_fn"] = partial(
             collate_fn,
             tokenizer=tokenizer,
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
             local_rank=args.local_rank,
-        ),
-        config=ds_config,
+        )
+    model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
+        **ds_init_kwargs
     )
 
     # resume deepspeed checkpoint
@@ -380,13 +418,13 @@ def main(args):
             ),
         )
 
-    train_iter = iter(train_loader)
     best_score, cur_ciou = 0.0, 0.0
 
     if args.eval_only:
         giou, ciou = validate(val_loader, model_engine, 0, writer, args)
         exit()
 
+    train_iter = iter(train_loader)
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
         train_iter = train(

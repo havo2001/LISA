@@ -155,8 +155,6 @@ class BUSIValDataset(Dataset):
         # Dummy labels: ValDataset uses ignore_label canvas
         labels = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
 
-        inference = True
-
         return (
             image_path,      # str
             image_sam,       # tensor for SAM
@@ -167,7 +165,7 @@ class BUSIValDataset(Dataset):
             resize,          # tuple(h, w) after SAM resize
             None,            # questions
             None,            # sampled_classes
-            inference,       # bool
+            True,            # inference
         )
 
 
