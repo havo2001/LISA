@@ -250,27 +250,41 @@ def main(args):
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
 
+    class _BUSITrainWrapper(torch.utils.data.Dataset):
+        """Mirrors HybridDataset's pattern: swaps inference=True -> False."""
+        def __init__(self, ds):
+            self.ds = ds
+        def __len__(self):
+            return len(self.ds)
+        def __getitem__(self, idx):
+            *sample, _ = self.ds[idx]   # drop inference=True
+            return (*sample, False)     # append inference=False
+
     if not args.eval_only:
-        train_dataset = HybridDataset(
-            args.dataset_dir,
-            tokenizer,
-            args.vision_tower,
-            samples_per_epoch=args.batch_size
-            * args.grad_accumulation_steps
-            * args.steps_per_epoch
-            * world_size,
-            precision=args.precision,
-            image_size=args.image_size,
-            num_classes_per_sample=args.num_classes_per_sample,
-            exclude_val=args.exclude_val,
-            dataset=args.dataset,
-            sample_rate=[float(x) for x in args.sample_rates.split(",")],
-            sem_seg_data=args.sem_seg_data,
-            refer_seg_data=args.refer_seg_data,
-            vqa_data=args.vqa_data,
-            reason_seg_data=args.reason_seg_data,
-            explanatory=args.explanatory,
-        )
+        if args.dataset:
+            train_dataset = HybridDataset(
+                args.dataset_dir,
+                tokenizer,
+                args.vision_tower,
+                samples_per_epoch=args.batch_size
+                * args.grad_accumulation_steps
+                * args.steps_per_epoch
+                * world_size,
+                precision=args.precision,
+                image_size=args.image_size,
+                num_classes_per_sample=args.num_classes_per_sample,
+                exclude_val=args.exclude_val,
+                dataset=args.dataset,
+                sample_rate=[float(x) for x in args.sample_rates.split(",")],
+                sem_seg_data=args.sem_seg_data,
+                refer_seg_data=args.refer_seg_data,
+                vqa_data=args.vqa_data,
+                reason_seg_data=args.reason_seg_data,
+                explanatory=args.explanatory,
+            )
+        else:
+            train_dataset = None
+
         if args.busi_train_json:
             busi_train_dataset = BUSIValDataset(
                 json_path=args.busi_train_json,
@@ -278,19 +292,13 @@ def main(args):
                 vision_tower=args.vision_tower,
                 image_size=args.image_size,
             )
-            # Mirror HybridDataset's pattern: strip the val-time inference=True
-            # that BUSIValDataset returns, and replace with inference=False for training.
-            class _BUSITrainWrapper(torch.utils.data.Dataset):
-                def __init__(self, ds):
-                    self.ds = ds
-                def __len__(self):
-                    return len(self.ds)
-                def __getitem__(self, idx):
-                    *sample, _ = self.ds[idx]   # drop inference=True
-                    return (*sample, False)      # append inference=False
-            train_dataset = torch.utils.data.ConcatDataset(
-                [train_dataset, _BUSITrainWrapper(busi_train_dataset)]
-            )
+            wrapped = _BUSITrainWrapper(busi_train_dataset)
+            if train_dataset is None:
+                train_dataset = wrapped
+            else:
+                train_dataset = torch.utils.data.ConcatDataset(
+                    [train_dataset, wrapped]
+                )
             print(f"Mixed in {len(busi_train_dataset)} BUSI training samples.")
     else:
         train_dataset = None

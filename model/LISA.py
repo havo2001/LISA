@@ -136,7 +136,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
         else:
             config.mm_vision_tower = config.vision_tower
-            
+            self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
+            self.dice_loss_weight = kwargs.pop("dice_loss_weight", 0.5)
+            self.bce_loss_weight = kwargs.pop("bce_loss_weight", 2.0)
+
         self.seg_token_idx = kwargs.pop("seg_token_idx")
 
         super().__init__(config)
