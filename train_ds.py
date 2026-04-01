@@ -21,6 +21,8 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
 
+os.environ["MPLBACKEND"] = "Agg"
+
 def dice_score(pred, gt, eps=1e-6):
     pred = pred.float()
     gt = gt.float()
