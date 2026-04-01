@@ -15,7 +15,7 @@ from utils.utils import DEFAULT_IMAGE_TOKEN
 from model.llava import conversation as conversation_lib
 
 
-def create_busi_json(data_root, prompt_file):
+def create_busi_json(data_root, prompt_file, json_path):
     images = []
     df = pd.read_excel(prompt_file)
     for _, row in df.iterrows():
@@ -33,10 +33,8 @@ def create_busi_json(data_root, prompt_file):
             "mask": mask_path,
             "prompt": row['Description']
         })
-    with open("utils/busi.json", "w") as f:
+    with open(json_path, "w") as f:
         json.dump(images, f)
-
-
 
 
 class BUSIValDataset(Dataset):
@@ -175,13 +173,24 @@ class BUSIValDataset(Dataset):
 
 
 if __name__ == "__main__":
-    if not os.path.exists("utils/busi.json"):
-        create_busi_json("dataset/Dataset_BUSI_with_GT", "dataset/Test_text_original.xlsx")
+    if not os.path.exists("utils/train_busi.json"):
+        create_busi_json("dataset/Dataset_BUSI_with_GT", "dataset/Train_text.xlsx", "utils/train_busi.json")
     else:
-        print("dataset/busi.json already exists")
+        print("utils/train_busi.json already exists")
+
+
+    if not os.path.exists("utils/val_busi.json"):
+        create_busi_json("dataset/Dataset_BUSI_with_GT", "dataset/Val_text.xlsx", "utils/val_busi.json")
+    else:
+        print("utils/val_busi.json already exists")
+
+    if not os.path.exists("utils/test_busi.json"):
+        create_busi_json("dataset/Dataset_BUSI_with_GT", "dataset/Test_text_original.xlsx", "utils/test_busi.json")
+    else:
+        print("utils/test_busi.json already exists")
 
     # test the json file
-    with open("utils/busi.json", "r") as f:
+    with open("utils/train_busi.json", "r") as f:
         data = json.load(f)
     # try to load one sample image and mask together with prompt
     image = data[0]['image']

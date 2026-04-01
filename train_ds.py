@@ -99,6 +99,8 @@ def parse_args(args):
     parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
     parser.add_argument("--eval_only", action="store_true", default=False)
+    parser.add_argument("--busi_json", default="utils/busi.json", type=str,
+                        help="Path to busi.json; used when --val_dataset=BUSI|test")
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--resume", default="", type=str)
@@ -263,10 +265,8 @@ def main(args):
 
     if args.no_eval == False:
         if args.val_dataset.startswith("BUSI|"):
-            _, split = args.val_dataset.split("|")
-            json_path = "utils/busi.json"
             val_dataset = BUSIValDataset(
-                json_path=json_path,
+                json_path=args.busi_json,
                 tokenizer=tokenizer,
                 vision_tower=args.vision_tower,
                 image_size=args.image_size,
