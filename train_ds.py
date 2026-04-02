@@ -9,6 +9,7 @@ os.environ["MPLBACKEND"] = "agg"
 
 import matplotlib
 matplotlib.use("agg")
+import cv2
 import deepspeed
 import numpy as np
 import torch
@@ -131,6 +132,7 @@ def main(args):
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
+        os.makedirs(args.vis_save_path, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
     else:
         writer = None
@@ -619,6 +621,41 @@ def validate(val_loader, model_engine, epoch, writer, args):
         masks_list = output_dict["gt_masks"][0].int()
         output_list = (pred_masks[0] > 0).int()
         assert len(pred_masks) == 1
+
+        # ---- visualisation (rank 0 only) ----
+        if args.local_rank == 0:
+            epoch_vis_dir = os.path.join(args.vis_save_path, f"epoch_{epoch}")
+            os.makedirs(epoch_vis_dir, exist_ok=True)
+
+            image_path = input_dict["image_paths"][0]
+            image_name = os.path.splitext(os.path.basename(image_path))[0]
+            image_np = cv2.imread(image_path)
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+            for i, pred_i in enumerate(pred_masks[0]):
+                pred_np = (pred_i.detach().float() > 0).cpu().numpy().astype(np.uint8)
+
+                cv2.imwrite(
+                    os.path.join(epoch_vis_dir, f"{image_name}_mask_{i}.png"),
+                    pred_np * 255,
+                )
+
+                pred_vis = pred_np.astype(bool)
+                if pred_vis.shape != image_np.shape[:2]:
+                    pred_vis = cv2.resize(
+                        pred_np, (image_np.shape[1], image_np.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+
+                overlay = image_np.copy()
+                overlay[pred_vis] = (
+                    0.5 * overlay[pred_vis] + 0.5 * np.array([255, 0, 0])
+                ).astype(np.uint8)
+                cv2.imwrite(
+                    os.path.join(epoch_vis_dir, f"{image_name}_overlay_{i}.png"),
+                    cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
+                )
+        # ---- end visualisation ----
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         acc_dice = 0.0
